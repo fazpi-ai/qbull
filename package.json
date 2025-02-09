@@ -1,6 +1,6 @@
 {
-  "name": "qbull",
-  "version": "1.0.0",
+  "name": "qube",
+  "version": "1.0.1",
   "description": "Simple group queue library.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
