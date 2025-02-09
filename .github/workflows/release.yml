@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Setup Node.js
@@ -24,14 +24,26 @@ jobs:
       - name: Build project
         run: npm run build
 
-      - name: Create artifact
-        run: zip -r qube-dist.zip .
+      - name: Compress dist folder
+        run: zip -r dist.zip dist
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      - name: Create release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          release_id: ${{ github.event.release.id }}
-          asset_path: ./qube-dist.zip
-          asset_name: qube-v${{ github.event.release.tag_name }}.zip
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+      - name: Upload release assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist.zip
+          asset_name: dist.zip
           asset_content_type: application/zip
