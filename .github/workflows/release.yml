@@ -1,0 +1,37 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build project
+        run: npm run build
+
+      - name: Create artifact
+        run: zip -r qube-dist.zip .
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          release_id: ${{ github.event.release.id }}
+          asset_path: ./qube-dist.zip
+          asset_name: qube-v${{ github.event.release.tag_name }}.zip
+          asset_content_type: application/zip
