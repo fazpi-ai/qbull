@@ -2,7 +2,8 @@
   "name": "qbull",
   "version": "1.0.0",
   "description": "Simple group queue library.",
-  "main": "index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
