@@ -25,6 +25,9 @@
     "type": "git",
     "url": "https://github.com/fazpi-ai/qube.git"
   },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com/"
+  },
   "devDependencies": {
     "nodemon": "^3.1.9",
     "ts-node": "^10.9.2",
