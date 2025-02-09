@@ -1,5 +1,5 @@
 {
-  "name": "qube",
+  "name": "@fazpi-ai/qube",
   "version": "1.0.1",
   "description": "Simple group queue library.",
   "main": "dist/index.js",
