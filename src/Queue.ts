@@ -5,7 +5,7 @@ import pino from 'pino';
 
 const logger = pino({ level: 'debug' });
 
-class Queue<DataType extends Record<string, string>> {
+export default class Queue<DataType extends Record<string, string>> {
     private pool!: Pool<Redis>;
     private processMap: Map<string, (message: DataType) => Promise<void>> = new Map();
     private nConsumersMap: Map<string, number> = new Map();
@@ -196,5 +196,3 @@ class Queue<DataType extends Record<string, string>> {
         this.nConsumersMap.set(streamName, nConsumers);
     }
 }
-
-export default Queue;
