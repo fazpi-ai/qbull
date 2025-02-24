@@ -1,0 +1,22 @@
+{
+  "name": "qbull",
+  "version": "1.0.0",
+  "description": "Processes jobs organized by groups.",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "dev": "nodemon --watch src --ext ts --exec ts-node src/index.ts"
+  },
+  "keywords": [],
+  "author": "Rafael Jose Garcia Suarez <rafaeljosegarciasuarez@gmail.com>",
+  "license": "GPL-3.0",
+  "devDependencies": {
+    "@types/node": "^22.13.5",
+    "nodemon": "^3.1.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}
