@@ -8,7 +8,7 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf dist",
-    "dev": "nodemon --watch src --ext ts --exec ts-node src/index.ts"
+    "dev": "tsx src/index.ts"
   },
   "keywords": [],
   "author": "Rafael Jose Garcia Suarez <rafaeljosegarciasuarez@gmail.com>",
@@ -17,6 +17,12 @@
     "@types/node": "^22.13.5",
     "nodemon": "^3.1.9",
     "ts-node": "^10.9.2",
+    "tsx": "^4.19.3",
     "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "generic-pool": "^3.9.0",
+    "ioredis": "^5.5.0",
+    "pino": "^9.6.0"
   }
 }
