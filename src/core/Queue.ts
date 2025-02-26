@@ -5,6 +5,27 @@ import { createRedisPool } from '../utils/redisPool';
 import { LuaScriptLoader } from '../utils/LuaScriptLoader';
 import { IJobData } from '../interfaces/queue.interface';
 
+interface ICallback {
+    (job: IJobData, done: (err?: Error) => void): void;
+}
+
+interface IProcessEntry {
+    callback: ICallback;
+    nConsumers: number;
+}
+
+interface IQueueInitOptions {
+    credentials: RedisOptions;
+    consumerLimits?: Record<string, number>;
+    logLevel: 'silent' | 'debug';
+}
+
+interface ILuaScriptResult {
+    jobId: number;
+    jobData: Record<string, any>; // O podrías usar `IJobData` si tienes una interfaz definida
+    groupName: string;
+}
+
 export class Queue {
     private client: Redis;
     private pool: Pool<Redis>;
@@ -15,30 +36,41 @@ export class Queue {
     private publisherClient: Redis;
     private subscriberClient: Redis;
 
-    private processMap = new Map();
+    private processMap = new Map<string, IProcessEntry>();
 
-    constructor(private credentials: RedisOptions, logLevel: string = 'debug') {
-        this.logger = new Logger(logLevel);
-        this.client = new Redis(credentials);
-        this.pool = createRedisPool(credentials);
+    constructor(options: IQueueInitOptions) {
+        this.logger = new Logger(options.logLevel);
+        this.client = new Redis(options.credentials);
+        this.pool = createRedisPool(options.credentials);
         this.scriptLoader = new LuaScriptLoader("lua-scripts");
 
-        this.publisherClient = new Redis(credentials);
-        this.subscriberClient = new Redis(credentials);
+        this.publisherClient = new Redis(options.credentials);
+        this.subscriberClient = new Redis(options.credentials);
 
         this.setupSubscriber();
     }
 
     public async init(): Promise<void> {
-        this.logger.info('Inicializando la cola...');
-        await this.loadAndRegisterScripts(['enqueue', 'dequeue', 'update_status', 'get_status', 'limit_consumers']);
-
-        this.startMonitor()
-
+        this.logger.info('Iniciando la cola y cargando scripts LUA...');
+        try {
+            await this.loadAndRegisterScripts([
+                'enqueue',
+                'dequeue',
+                'update_status',
+                'get_status',
+                'limit_consumers'
+            ]);
+            this.logger.info('✅ Todos los scripts LUA se han cargado correctamente.');
+        } catch (error) {
+            this.logger.error(`❌ Error al cargar los scripts LUA: ${(error as Error).message}`);
+            throw error;
+        }
     }
 
     private async loadAndRegisterScripts(scriptNames: string[]): Promise<void> {
+        this.logger.info('Cargamos los cript LUA.');
         for (const name of scriptNames) {
+            this.logger.info(`Cargamos el script lua ${name}.`);
             await this.scriptLoader.loadScript(name);
             const scriptContent = this.scriptLoader.getScript(name);
             if (scriptContent) {
@@ -55,143 +87,84 @@ export class Queue {
         }
     }
 
-    private async executeScript(scriptName: string, keys: string[] = [], args: (string | number)[] = []): Promise<any> {
+    private async executeScript(
+        scriptName: string,
+        keys: string[] = [],
+        args: (string | number)[] = []
+    ): Promise<ILuaScriptResult | number | null> {  // 🔹 Ahora puede devolver null
         const sha = this.scriptShas.get(scriptName);
         if (!sha) {
             throw new Error(`Script ${scriptName} no está registrado.`);
         }
-        return this.client.evalsha(sha, keys.length, ...keys, ...args);
+
+        const result = await this.client.evalsha(sha, keys.length, ...keys, ...args);
+
+        // 🔹 Si el resultado es null, lo devolvemos tal cual sin error
+        if (result === null) {
+            this.logger.info(`ℹ️ El script ${scriptName} devolvió null (no hay trabajos disponibles).`);
+            return null;
+        }
+
+        // 🔹 Si el resultado es un número (para enqueue.lua)
+        if (typeof result === "number" || typeof result === "string") {
+            this.logger.info(`✅ El script ${scriptName} devolvió un jobId: ${result}`);
+            return Number(result);
+        }
+
+        // 🔹 Si el resultado es un array (para dequeue.lua)
+        if (Array.isArray(result) && result.length >= 3) {
+            return {
+                jobId: Number(result[0]),
+                jobData: typeof result[1] === 'string' ? JSON.parse(result[1]) : result[1],
+                groupName: String(result[2])
+            };
+        }
+
+        throw new Error(`El script ${scriptName} devolvió un resultado inesperado: ${JSON.stringify(result)}`);
     }
 
-    public async add(queueName: string, groupName: string, data: any): Promise<void> {
-        const keys = [`qube:${queueName}:groups`, `qube:${queueName}:group:${groupName}`];
-        const args = [JSON.stringify(data), groupName];
-
-        const jobId = await this.executeScript('enqueue', keys, args);
-
-        this.logger.info(`jobId: ${jobId}`);
-
-        await this.publisherClient.publish(`QUEUE:NEWJOB`, JSON.stringify({ queueName, groupName }));
-
-        return jobId;
-    }
-
-    public async process(queueName: string, nConsumers: number, callback: (job: IJobData, done: (err?: Error) => void) => void): Promise<void> {
-        this.logger.info(`Registrando procesadores para la cola '${queueName}' con ${nConsumers} consumidores`);
+    public async getActiveConsumersCount(queueName: string, groupName: string): Promise<number> {
+        const pattern = `qube:consumer:${queueName}:${groupName}:*`;
         const client = await this.pool.acquire();
         try {
-            this.processMap.set(queueName, { callback, nConsumers });
+            const keys = await client.keys(pattern);
+            return keys.length; // Número de consumidores activos
         } finally {
             this.pool.release(client);
         }
     }
 
-    private async isConsumerBusy(queueName: string, groupName: string, workerId: string): Promise<boolean> {
+    // Este metodo se encarga de registrar la key del consumidor
+    private async registerConsumer(queueName: string, groupName: string): Promise<string> {
         const client = await this.pool.acquire();
         try {
+            const workerId = Math.random().toString(36).substring(2, 11); // Genera un ID único
+            const ttl = 30; // Tiempo de vida del consumidor en segundos
             const consumerKey = `qube:consumer:${queueName}:${groupName}:${workerId}`;
-            const exists = await client.exists(consumerKey);
-            return exists === 1;
+
+            await client.set(consumerKey, 'active', 'EX', ttl);
+            this.logger.info(`Consumidor registrado: ${consumerKey} (TTL: ${ttl}s)`);
+            return workerId;
+        } catch (error) {
+            const err = error as Error;
+            this.logger.error(`Error registrando consumidor en ${queueName}:${groupName} - ${err.message}`);
+            throw error;
         } finally {
             this.pool.release(client);
         }
     }
 
-    private async getGroupNames(queueName: string): Promise<string[]> {
-        const client = await this.pool.acquire();
-        const pattern = `qube:${queueName}:group:*`;
-        let cursor = '0';
-        let groupNames: string[] = [];
-
-        try {
-            do {
-                const [nextCursor, keys] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-                cursor = nextCursor;
-                const groups = keys.map(key => key.split(':').pop()!); // Extrae el groupName del key
-                groupNames.push(...groups);
-            } while (cursor !== '0');
-
-            return groupNames;
-        } finally {
-            this.pool.release(client);
-        }
-    }
-
-    private async removeConsumer(queueName: string, groupName: string, workerId: string): Promise<void> {
-        const client = await this.pool.acquire();
-        try {
-            const consumerKey = `qube:consumer:${queueName}:${groupName}:${workerId}`;
-            await client.del(consumerKey);
-            this.logger.info(`Consumidor eliminado: ${consumerKey}`);
-        } finally {
-            this.pool.release(client);
-        }
-    }
-
-    private async startMonitor(): Promise<void> {
-        const interval = 10 * 1000; // Cada 10 segundos
-
-        setInterval(async () => {
-            this.logger.info('Ejecutando tarea periódica cada 10 segundos');
-
-            for (const [queueName, { nConsumers }] of this.processMap.entries()) {
-                this.logger.info(`Revisando la cola: ${queueName} con ${nConsumers} consumidores`);
-
-                const groupNames = await this.getGroupNames(queueName);
-
-                for (const groupName of groupNames) {
-                    const client = await this.pool.acquire();
-                    try {
-                        // Escanear los consumidores activos con el patrón de STRINGS
-                        const pattern = `qube:consumer:${queueName}:${groupName}:*`;
-                        let cursor = '0';
-
-                        do {
-                            const [nextCursor, keys] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-                            cursor = nextCursor;
-
-                            for (const consumerKey of keys) {
-                                const workerId = consumerKey.split(':').pop()!;
-                                const isBusy = await this.isConsumerBusy(queueName, groupName, workerId);
-
-                                if (isBusy) {
-                                    await this.renewConsumerTTL(queueName, groupName, workerId, 30); // Renovar TTL
-                                    this.logger.info(`Renovado TTL para consumidor: ${consumerKey}`);
-                                } else {
-                                    await this.removeConsumer(queueName, groupName, workerId); // Eliminar consumidor
-                                    this.logger.info(`Consumidor eliminado: ${consumerKey}`);
-                                }
-                            }
-                        } while (cursor !== '0');
-                    } finally {
-                        this.pool.release(client);
-                    }
-                }
-            }
-        }, interval);
-    }
-
-    public async startGroupConsumer(queueName: string, groupName: string, workerId: string): Promise<void> {
-        const client = await this.pool.acquire();
-        try {
-            this.logger.info(`START GROUP CONSUMER queueName: ${queueName}, groupName: ${groupName}, workerId: ${workerId}`);
-            await this.groupWorker(queueName, groupName, workerId);
-        } finally {
-            this.pool.release(client);
-        }
-    }
-
-    private async updateJobStatus(jobId: string, newStatus: string) {
-        await this.executeScript('update_status', [], [jobId, newStatus]);
-    }
-
-    private async updateProgress(jobId: string, value: number): Promise<void> {
+    private async updateProgress(jobId: number, value: number): Promise<void> {
         const client = await this.pool.acquire();
         try {
             await client.hset(`qube:queue:job:${jobId}`, 'progress', value);
         } finally {
             this.pool.release(client);
         }
+    }
+
+    private async updateJobStatus(jobId: number, newStatus: string) {
+        await this.executeScript('update_status', [], [jobId, newStatus]);
     }
 
     private async processJob(job: IJobData, fn: any) {
@@ -210,97 +183,60 @@ export class Queue {
         }
     }
 
-    private async canStartConsumer(queueName: string, groupName: string, maxConsumers: number): Promise<string | null> {
-        const workerId = Math.random().toString(36).substr(2, 9);
-        const keyPrefix = `qube:consumer:${queueName}:${groupName}`;
-        const ttl = 30; // TTL en segundos
-    
-        const sha = this.scriptShas.get('limit_consumers');
-        if (!sha) {
-            throw new Error('El script limit_consumers no está cargado.');
-        }
-    
+    // Este metodo se encarga de levantar un nuevo consumidor para el grupo
+    private async startGroupConsumer(queueName: string, groupName: string): Promise<void> {
         const client = await this.pool.acquire();
+        const refreshInterval = 10 * 1000;
         try {
-            const result = await client.evalsha(
-                sha,
-                1, // Número de claves
-                keyPrefix, // Prefijo de la clave
-                maxConsumers,
-                workerId,
-                ttl
-            );
-    
-            if (result === 1) {
-                this.logger.info(`✅ Consumidor registrado con ID: ${workerId}`);
-                return workerId; // Consumidor creado exitosamente
-            } else {
-                this.logger.info(`❌ No se pudo iniciar consumidor (máximo alcanzado)`);
-                return null; // No se permitió crear el consumidor
-            }
-        } finally {
-            this.pool.release(client);
-        }
-    }
-
-    private async renewConsumerTTL(queueName: string, groupName: string, workerId: string, ttl: number): Promise<void> {
-        const client = await this.pool.acquire();
-        try {
+            this.logger.info(`Registramos un consumidor para ${queueName}:${groupName}.`);
+            const workerId = await this.registerConsumer(queueName, groupName);
             const consumerKey = `qube:consumer:${queueName}:${groupName}:${workerId}`;
-            await client.expire(consumerKey, ttl);
-            this.logger.info(`Renovado TTL para consumidor: ${consumerKey}`);
-        } finally {
-            this.pool.release(client);
-        }
-    }
 
-    private async registerConsumer(queueName: string, groupName: string, workerId: string, ttl: number): Promise<void> {
-        const client = await this.pool.acquire();
-        try {
-            const consumerKey = `qube:consumer:${queueName}:${groupName}:${workerId}`;
-            await client.set(consumerKey, 'active', 'EX', ttl); // Crea un string con TTL
-            this.logger.info(`Consumidor registrado: ${consumerKey}`);
-        } finally {
-            this.pool.release(client);
-        }
-    }
+            console.log(`Iniciamos un heartbeat para ${queueName}:${groupName}`);
+            const heartbeat = setInterval(async () => {
+                try {
+                    await client.expire(consumerKey, 30);
+                    this.logger.info(`🔄 Consumidor ${queueName}:${groupName}:${workerId}: TTL renovado.`);
+                } catch (error) {
+                    this.logger.error(`❌ Error renovando TTL para ${queueName}:${groupName}:${workerId}: ${(error as Error).message}`);
+                }
+            }, refreshInterval);
 
-    // Uso en el método groupWorker para renovar el TTL mientras haya trabajos pendientes
-    private async groupWorker(queueName: string, groupName: string, workerId: string): Promise<void> {
-        const client = await this.pool.acquire();
-        const ttl = 30; // TTL en segundos
-        const refreshInterval = 10; // Renovar cada 10 segundos
-    
-        // Registrar el consumidor (usando el workerId recibido)
-        await this.registerConsumer(queueName, groupName, workerId, ttl);
-    
-        const renewTTLInterval = setInterval(() => {
-            this.renewConsumerTTL(queueName, groupName, workerId, ttl);
-        }, refreshInterval * 1000);
-    
-        try {
+            // Recurremos indefinidamente procesando trabajos de la cola de trabajos
             while (true) {
                 const groupQueueKey = `qube:${queueName}:group:${groupName}`;
-                const result = await this.executeScript('dequeue', [groupQueueKey]);
-    
-                if (result) {
-                    const [jobId, jobDataRaw, groupNameFromJob] = result;
-                    const jobDataParsed = jobDataRaw ? JSON.parse(jobDataRaw) : null;
+                // TODO VALIDADOR DE TIPADO
+                const result: ILuaScriptResult = await this.executeScript('dequeue', [groupQueueKey], []) as ILuaScriptResult;
+
+                if (typeof result === 'object' && result !== null) {
+
+                    const { jobId, jobData, groupName } = result;
+
                     const job: IJobData = {
                         id: jobId,
-                        data: jobDataParsed,
-                        groupName: groupNameFromJob ? groupNameFromJob.toString() : '',
+                        data: jobData,
+                        groupName,
                         progress: async (value: number) => await this.updateProgress(jobId, value)
                     };
-                    await this.processJob(job, this.processMap.get(queueName).callback);
+
+                    const processData = this.processMap.get(queueName);
+                    if (!processData) {
+                        this.logger.warn(`No se encontró configuración para la cola ${queueName}`);
+                        break; // O return, según la lógica que necesites
+                    }
+                    await this.processJob(job, processData.callback);
                 } else {
-                    break; // Salir cuando no haya trabajos pendientes
+                    this.logger.info(`ℹ️ No hay más trabajos en la cola ${queueName}:${groupName}. Finalizando consumidor.`);
+                    break;
                 }
             }
+
+            clearInterval(heartbeat);
+            await client.del(consumerKey);
+            this.logger.info(`🛑 Consumidor finalizado y eliminado: ${consumerKey}`);
+
         } finally {
-            clearInterval(renewTTLInterval);
-            await this.removeConsumer(queueName, groupName, workerId);
-            await this.pool.release(client);
+            this.pool.release(client);
         }
     }
 
@@ -308,29 +244,67 @@ export class Queue {
         this.subscriberClient.on('message', async (channel: string, message: string) => {
             if (channel === 'QUEUE:NEWJOB') {
                 const { queueName, groupName } = JSON.parse(message);
-    
-                if (this.processMap.has(queueName)) {
-                    const nConsumers = this.processMap.get(queueName).nConsumers;
-                    const workerId = await this.canStartConsumer(queueName, groupName, nConsumers);
-                    if (!workerId) {
-                        this.logger.info(`❌ Ya se alcanzó el máximo de consumidores para ${queueName}:${groupName}`);
-                        return;
-                    }
-                    this.logger.info(`✅ Iniciando nuevo consumidor para ${queueName}:${groupName} con ID: ${workerId}`);
-                    await this.startGroupConsumer(queueName, groupName, workerId);
-                } else {
-                    this.logger.warn(`⚠️ No hay callback asociado al queueName '${queueName}', ignorando notificación.`);
+                this.logger.info(`Recibimos un nuevo mensaje de QUEUE:NEWJOB ${queueName}:${groupName}.`);
+                const processData = this.processMap.get(queueName);
+                if (!processData) {
+                    this.logger.warn(`⚠️ No hay callback registrado para la cola '${queueName}', ignorando.`);
+                    return;
                 }
+                const { nConsumers } = processData;
+                this.logger.info(`Numero de consumidores maximos para ${queueName} es ${nConsumers}.`);
+
+                this.logger.info(`Preguntamos a REDIS cuantos consumidores hay para ${queueName}.`);
+
+                const consumersCount = await this.getActiveConsumersCount(queueName, groupName)
+
+                this.logger.info(`Para ${queueName} tenemos ${consumersCount} consumidores.`);
+
+                if (consumersCount === 0 || consumersCount < nConsumers) {
+                    // Podemos levantar un nuevo consumidor porque aun no se llega al maximo de consumidores permitidos para esta cola y grupo.
+                    this.startGroupConsumer(queueName, groupName)
+                } else {
+                    // En este punto quiere decir que llego a el tope entonces dejamos esto sin hace nada? dado que cuando termine.
+
+                }
+
             }
         });
-    
+        this.logger.info('Nos suscribimos a redis para recibir notificaciones.');
         this.subscriberClient.subscribe('QUEUE:NEWJOB', (err, count) => {
             if (err) {
                 this.logger.error(`Error suscribiéndose a 'QUEUE:NEWJOB': ${err.message}`);
             } else {
-                this.logger.info(`🔔 Suscrito a ${count} canal(es), esperando mensajes...`);
+                this.logger.info(`Suscrito a ${count} canal(es), esperando mensajes...`);
             }
         });
+    }
+
+    public async add(queueName: string, groupName: string, data: any): Promise<number> {
+        const keys = [`qube:${queueName}:groups`, `qube:${queueName}:group:${groupName}`];
+        const args = [JSON.stringify(data), groupName];
+
+        try {
+            const result = await this.executeScript('enqueue', keys, args);
+
+            if (typeof result !== "number") {
+                throw new Error(`Error: enqueue.lua devolvió un valor inesperado: ${JSON.stringify(result)}`);
+            }
+
+            this.logger.info(`Trabajo encolado con jobId: ${result}`);
+
+            await this.publisherClient.publish(`QUEUE:NEWJOB`, JSON.stringify({ queueName, groupName }));
+
+            return result;
+        } catch (error) {
+            this.logger.error(`Error en add(): ${(error as Error).message}`);
+            throw error;
+        }
+    }
+
+    // Eliminamos el loop genérico en process()
+    public async process(queueName: string, nConsumers: number, callback: ICallback): Promise<void> {
+        this.logger.info(`Registrando procesadores para la cola '${queueName}' con ${nConsumers} consumidores.`);
+        this.processMap.set(queueName, { callback, nConsumers });
     }
 
     public async close(): Promise<void> {
@@ -341,4 +315,5 @@ export class Queue {
         await this.pool.drain();
         await this.pool.clear();
     }
+
 }

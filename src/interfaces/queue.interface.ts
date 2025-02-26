@@ -1,5 +1,5 @@
 export interface IJobData {
-    id: string;
+    id: number;
     data: any;
     groupName: string;
     progress: (value: number) => Promise<void>;

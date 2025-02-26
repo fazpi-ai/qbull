@@ -29,10 +29,18 @@ const delay = (min: number, max: number) => {
         logLevel: 'silent'
     });
 
+    const queue2 = new Queue({
+        credentials: redisConfig,
+        consumerLimits: {
+            QUEUE_MULTI_INSTANCE: 1
+        },
+        logLevel: 'silent'
+    });
+
     await queue.init();
 
     await queue.process('QUEUE_MULTI_INSTANCE', 1, async (job: IJobData, done) => {
-        console.log("😎 JOBS:")
+        console.log("😎 JOBS 1:")
         console.log(job)
 
         await delay(10, 40);
@@ -42,6 +50,17 @@ const delay = (min: number, max: number) => {
         done();
     });
 
+    await queue2.process('QUEUE_MULTI_INSTANCE', 1, async (job: IJobData, done) => {
+        console.log("😎 JOBS 2:")
+        console.log(job)
+
+        await delay(10, 40);
+
+        console.log("-")
+
+        done();
+    });
+    
     await queue.add('QUEUE_MULTI_INSTANCE', 'group-1', {
         to: `57320510441`,
         content: `Trabajo desde group-1`,
