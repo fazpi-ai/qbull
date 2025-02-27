@@ -1,0 +1,33 @@
+{
+  "name": "qbull",
+  "version": "1.0.0",
+  "description": "Processes jobs organized by groups.",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "dev": "tsx src/index.ts",
+    "test": "jest",
+    "test:watch": "jest --watchAll"
+  },
+  "keywords": [],
+  "author": "Rafael Jose Garcia Suarez <rafaeljosegarciasuarez@gmail.com>",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "generic-pool": "^3.9.0",
+    "ioredis": "^5.5.0",
+    "pino": "^9.6.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.13.5",
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.9",
+    "ts-jest": "^29.2.6",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}
