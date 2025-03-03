@@ -19,6 +19,7 @@ export interface IQueueInitOptions {
     credentials: RedisOptions;
     consumerLimits?: Record<string, number>;
     logLevel: 'silent' | 'debug';
+    type: 'publisher' | 'subscriber';
 }
 
 export interface ILuaScriptResult {

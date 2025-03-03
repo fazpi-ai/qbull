@@ -1,13 +1,11 @@
 import Redis, { RedisOptions } from 'ioredis';
+import pino from 'pino';
 import { createPool, Pool } from 'generic-pool';
 import { v4 as uuidv4 } from 'uuid';
 
 import { promises as fs } from 'fs';
 import { join } from 'path';
 
-import { Logger } from './utils/logger';
-import { createRedisPool } from './utils/redisPool';
-import { LuaScriptLoader } from './utils/LuaScriptLoader';
 import { IJobData, ICallback, IProcessEntry, IQueueInitOptions, ILuaScriptResult, ILastTaskTime } from './interfaces/queue.interface';
 
 interface IRedisManager {
@@ -16,44 +14,66 @@ interface IRedisManager {
     logLevel: string
 }
 
+class Logger {
+    private logger;
+
+    constructor(level: string) {
+        this.logger = pino({ level });
+    }
+
+    info(message: string) {
+        this.logger.info(`${message}`);
+    }
+
+    error(message: string) {
+        this.logger.error(`${message}`);
+    }
+
+    warn(message: string) {
+        this.logger.warn(`${message}`);
+    }
+}
+
 // Esta clase gestionara todos los temas relacionados con redis, incluyendo la carga y procesamiento de los script lua
 class RedisManager {
-
     private logger: Logger;
-
     private pool: Pool<Redis>;
-
-    private scripts: string[];
-
-    private scriptsDir: string = "scripts"
-
+    private scripts: string[] = ["dequeue", "enqueue", "get_status", "update_status"];
+    private scriptsDir: string = "src/scripts";
+    private scriptContents: Map<string, string> = new Map();
     private scriptShas: Map<string, string> = new Map();
 
     constructor(options: IRedisManager) {
-
         this.pool = createPool(
             {
                 create: async () => new Redis(options.credentials),
-                destroy: async (client) => {
+                destroy: async (client: Redis) => {
                     await client.quit();
-                }
+                    return Promise.resolve();
+                },
             },
             {
                 max: 1000,
-                min: 5
+                min: 5,
             }
         );
 
         this.scripts = options.scripts;
 
         this.logger = new Logger(options.logLevel);
+    }
 
+    // obtener el script sha por el nombre del script
+    public getScriptSha = (scriptName: string): string | undefined => {
+        console.log("🔑 SCRIPT SHAS:")
+        console.log(this.scriptShas)
+        return this.scriptShas.get(scriptName);
     }
 
     public async init(): Promise<void> {
         this.logger.info('Iniciando la cola y cargando scripts LUA...');
         try {
-            await this.loadAndRegisterLuaScripts(this.scripts);
+            await this.loadAndRegisterLuaScripts();
             this.logger.info('✅ Todos los scripts LUA se han cargado correctamente.');
         } catch (error) {
             this.logger.error(`❌ Error al cargar los scripts LUA: ${(error as Error).message}`);
@@ -61,18 +81,16 @@ class RedisManager {
         }
     }
 
-    private async loadAndRegisterLuaScripts(scriptNames: string[]): Promise<void> {
-        this.logger.info('Cargamos los scripts LUA.');
-        for (const name of scriptNames) {
-            await this.loadLuaScript(name);
-            const scriptContent = this.getLuaScript(name);
-            this.logger.info(`Cargamos el script lua ${name}.`);
+    private async loadAndRegisterLuaScripts(): Promise<void> {
+        this.logger.info('Cargando scripts LUA...');
+        for (const name of this.scripts) {
+            const scriptContent = await this.loadLuaScript(name);
             if (scriptContent) {
                 const client = await this.pool.acquire();
                 try {
                     const sha = await client.script('LOAD', scriptContent) as string;
-                    this.logger.info(`SHA generado para ${name}: ${sha}`);
                     this.scriptShas.set(name, sha);
+                    this.logger.info(`SHA generado para ${name}: ${sha}`);
                 } finally {
                     this.pool.release(client);
                 }
@@ -82,18 +100,16 @@ class RedisManager {
         }
     }
 
-    async loadLuaScript(scriptName: string): Promise<void> {
+    private async loadLuaScript(scriptName: string): Promise<string | null> {
         const filePath = join(__dirname, '..', this.scriptsDir, `${scriptName}.lua`);
         try {
             const scriptContent = await fs.readFile(filePath, 'utf8');
-            this.scriptShas.set(scriptName, scriptContent);
+            this.scriptContents.set(scriptName, scriptContent);
+            return scriptContent;
         } catch (error) {
-            console.error(`Error loading script ${scriptName}:`, error);
+            this.logger.error(`Error cargando script ${scriptName}: ${(error as Error).message}`);
+            return null;
         }
-    }
-
-    private getLuaScript(scriptName: string): string | undefined {
-        return this.scriptShas.get(scriptName);
     }
 
     public async getClient(): Promise<Redis> {
@@ -108,123 +124,158 @@ class RedisManager {
         await this.pool.drain();
         await this.pool.clear();
     }
-
 }
 
-class Cleaner {
-
-    constructor() {
-
-    }
-
-}
-
-// Clase encargada de la gestion de los trabajos
-class Job {
-
-    constructor() {
-
-    }
-
-}
-
-// Esta clase es la encargada de gestionar la logica y las opciones de un consumidor en especial, tener en cuenta que cuando se llama a run es porque ya un script LUA creo un registro en redis, entonces si este consumidor falla entonces tenemos que eliminar ese registro en redis para evitar tener registros inecesarios.
+// Clase que representa un consumidor de la cola
 class Consumer {
-
-    // Este uid identfica esta instancia de consumidor de una lista de instancias de consumidores
     public uid: string = uuidv4();
-
-    public status: 'SLEEPING' | 'RUNNING' = 'SLEEPING'; // SLEEPING = No esta procesando trabajos, RUNNING = Esta procesando trabajos.
-
-    private qsession: string;
-
+    public status: 'SLEEPING' | 'RUNNING' = 'SLEEPING';
     private queueName: string;
-
     private callback: ICallback;
 
-    constructor(qsession: string, queueName: string, callback: ICallback) {
-
-        this.qsession = qsession;
+    constructor(private qsession: string, queueName: string, callback: ICallback) {
         this.queueName = queueName;
-        this.status = 'SLEEPING';
         this.callback = callback;
     }
 
-    public run = (): void => {
+    public async run(jobData: IJobData): Promise<void> {
         if (this.status === 'RUNNING') {
-            throw new Error(`❎ El consumidor de la cola ${this.queueName} con sesión ${this.qsession} ya está en ejecución. No es posible iniciar nuevamente este consumidor a menos que esté en estado de espera.`);
+            throw new Error(`❎ El consumidor de la cola ${this.queueName} ya está en ejecución.`);
         }
         this.status = 'RUNNING';
-        // Ejecutamos callback
-    }
 
+        try {
+            await new Promise<void>((resolve, reject) => {
+                this.callback(jobData, (err?: Error) => {
+                    if (err) {
+                        reject(err);
+                    } else {
+                        resolve();
+                    }
+                });
+            });
+        } catch (error: unknown) {
+            if (error instanceof Error) {
+                console.error(`❌ Error en el consumidor de ${this.queueName}: ${error.message}`);
+            } else {
+                console.error(`❌ Error desconocido en el consumidor de ${this.queueName}: ${String(error)}`);
+            }
+        } finally {
+            this.status = 'SLEEPING';
+        }
+    }
 }
 
 // QUEUE:GROUPNAME:SESSIONID
 
+// Clase principal de la cola de procesamiento
 export class Queue {
-
     private uid: string;
-
     private logger: Logger;
-
-    private publisherClient: Redis;
-
-    private subscriberClient: Redis;
-
+    private subscriberClient?: Redis;
+    private publisherClient?: Redis;
+    private type: 'publisher' | 'subscriber';
     private redisManager: RedisManager;
-
     private consumerLimits?: Record<string, number>;
-
-    private processMap = new Map<string, IProcessEntry>();
-
-    // Almacenar los consumidores creados
     private consumers = new Map<string, Consumer>();
 
     constructor(options: IQueueInitOptions) {
-
+        this.uid = uuidv4();
         this.logger = new Logger(options.logLevel);
-
-        this.publisherClient = new Redis(options.credentials);
-
-        this.subscriberClient = new Redis(options.credentials);
-
-        this.consumerLimits = options.consumerLimits;
-
         this.redisManager = new RedisManager({
             credentials: options.credentials,
             scripts: ["dequeue", "enqueue", "get_status", "update_status"],
             logLevel: "debug"
-        })
+        });
 
-        // Agregamos esta variable para asignarle un id a esta instancia de esta clase
-        this.uid = uuidv4()
+        this.logger.info(`🔑 Iniciando cola con UID: ${this.uid}.`);
 
-        // Nos suscribimos a los eventos de nuevos mensajes y a los eventos de esta sesion
-        this.setupSubscriber();
+        this.type = options.type;
+        this.consumerLimits = options.consumerLimits;
+
+        if (options.type === 'subscriber') {
+            this.subscriberClient = new Redis(options.credentials);
+            this.setupSubscriber();
+        }
+
+        if (options.type === 'publisher') {
+            this.publisherClient = new Redis(options.credentials);
+        }
+    }
+
+    public init = async () => {
+        await this.redisManager.init();
+    }
+
+    public getUid = () => {
+        return this.uid;
     }
 
     private setupSubscriber(): void {
-        // Nos sucribimos a los canales de mensajeria de la libreria
+        if (this.subscriberClient) {
+            this.subscriberClient.subscribe('QUEUE:NEWJOB', (err) => {
+                if (err) {
+                    this.logger.error(`❌ Error al suscribirse al canal de trabajos: ${err.message}`);
+                } else {
+                    this.logger.info(`📡 Suscrito al canal de trabajos desde ${this.uid}.`);
+                }
+            });
 
+            this.subscriberClient.on('message', async (channel, message) => {
+                this.logger.info(`📨 Mensaje recibido en ${channel}: ${message} desde ${this.uid}.`);
+                const jobData = JSON.parse(message);
+
+                const consumer = this.consumers.get(jobData.queueName);
+                if (consumer) {
+                    await consumer.run(jobData);
+                }
+            });
+        } else {
+            this.logger.error('❌ No se pudo suscribir al canal de trabajos.');
+        }
     }
 
-    public add(queueName: string, groupName: string, data: any) {
-        // Publicamos el trabajo usando el script lua.
-
-        // Notificamos a todos los clientes del nuevo trabjo.
-
+    public async add(queueName: string, groupName: string, data: any): Promise<any> {
+        this.logger.info(`Agregando trabajo '${queueName}' al grupo '${groupName}' con datos: ${JSON.stringify(data)}`);
+        const client = await this.redisManager.getClient();
+        try {
+            const scriptSha = this.redisManager.getScriptSha('enqueue') as string;
+            if (!scriptSha) {
+                this.logger.error('❌ No se pudo obtener el SHA del script "enqueue".');
+                return null;
+            }
+            // Convertimos explícitamente los argumentos a string
+            const queueKey = String(`qube:${queueName}:groups`);
+            const groupKey = String(`qube:${queueName}:group:${groupName}`);
+            const jobId = await client.evalsha(scriptSha, 2, queueKey, groupKey, String(JSON.stringify(data)), groupName);
+            if (this.publisherClient) {
+                await this.publisherClient.publish('QUEUE:NEWJOB', JSON.stringify({ queueName, groupName }));
+            }
+            return jobId;
+        } catch (error: unknown) {
+            if (error instanceof Error) {
+                this.logger.error(`❌ Error al agregar trabajo: ${error.message}`);
+            } else {
+                this.logger.error(`❌ Error al agregar trabajo: ${String(error)}`);
+            }
+            return null;
+        } finally {
+            this.redisManager.releaseClient(client);
+        }
     }
 
     public async process(queueName: string, callback: ICallback): Promise<void> {
-        this.logger.info(`Registrando procesador para la cola '${queueName}'.`);
-        // Agregamos a la pila de consumers de esta instancia este metodo para esata cola.
+        this.logger.info(`Registrando procesador para la cola '${queueName}' desde ${this.uid}.`);
+        if (this.consumers.has(queueName)) {
+            throw new Error(`Ya existe un procesador para la cola '${queueName}'.`);
+        }
+
+        const consumer = new Consumer(uuidv4(), queueName, callback);
+        this.consumers.set(queueName, consumer);
     }
 
     public async close(): Promise<void> {
         this.logger.info('Cerrando conexiones...');
-        await this.publisherClient.quit();
-        await this.subscriberClient.quit();
+        await this.redisManager.quit();
     }
-
 }

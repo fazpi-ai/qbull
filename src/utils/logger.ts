@@ -8,14 +8,14 @@ export class Logger {
   }
 
   info(message: string) {
-    this.logger.info(message);
+    this.logger.info(`\n${message}\n`);
   }
 
   error(message: string) {
-    this.logger.error(message);
+    this.logger.error(`\n${message}\n`);
   }
 
   warn(message: string) {
-    this.logger.warn(message);
+    this.logger.warn(`\n${message}\n`);
   }
 }
