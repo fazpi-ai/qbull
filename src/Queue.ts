@@ -65,8 +65,6 @@ class RedisManager {
 
     // obtener el script sha por el nombre del script
     public getScriptSha = (scriptName: string): string | undefined => {
-        console.log("🔑 SCRIPT SHAS:")
-        console.log(this.scriptShas)
         return this.scriptShas.get(scriptName);
     }
 
@@ -178,6 +176,7 @@ export class Queue {
     private redisManager: RedisManager;
     private consumerLimits?: Record<string, number>;
     private consumers = new Map<string, Consumer>();
+    private activeProcessingInterval: NodeJS.Timeout | null = null;
 
     constructor(options: IQueueInitOptions) {
         this.uid = uuidv4();
@@ -205,6 +204,82 @@ export class Queue {
 
     public init = async () => {
         await this.redisManager.init();
+        
+        // Si es un suscriptor, iniciar el procesamiento activo de tareas
+        if (this.type === 'subscriber') {
+            this.startActiveProcessing();
+        }
+    }
+
+    private startActiveProcessing(): void {
+        // Evitar iniciar múltiples intervalos
+        if (this.activeProcessingInterval) {
+            clearInterval(this.activeProcessingInterval);
+        }
+        
+        // Procesar activamente las tareas cada 5 segundos
+        this.activeProcessingInterval = setInterval(async () => {
+            // Procesar cada cola para la que tenemos un consumidor registrado
+            for (const [queueName, consumer] of this.consumers.entries()) {
+                // Solo procesar si el consumidor no está ocupado
+                if (consumer.status === 'SLEEPING') {
+                    await this.processQueueTasks(queueName, consumer);
+                }
+            }
+        }, 5000); // Intervalo de 5 segundos
+    }
+
+    private async processQueueTasks(queueName: string, consumer: Consumer): Promise<void> {
+        const client = await this.redisManager.getClient();
+        try {
+            // Obtener el SHA del script dequeue
+            const scriptSha = this.redisManager.getScriptSha('dequeue');
+            if (!scriptSha) {
+                this.logger.error(`❌ No se pudo obtener el SHA del script "dequeue" para la cola ${queueName}.`);
+                return;
+            }
+
+            // Obtener todas las claves de grupo para esta cola
+            const queueGroupsKey = `qube:${queueName}:groups`;
+            const groupKeys = await client.smembers(queueGroupsKey);
+
+            // Procesar cada grupo
+            for (const groupKey of groupKeys) {
+                // Ejecutar el script dequeue para obtener el trabajo
+                const result = await client.evalsha(scriptSha, 1, groupKey);
+                
+                if (result && Array.isArray(result)) {
+                    // El resultado es un array con [job_id, job_data, group_name]
+                    const [jobId, jobDataStr, groupName] = result;
+                    
+                    // Parsear los datos del trabajo
+                    const jobData = {
+                        id: jobId,
+                        data: JSON.parse(jobDataStr),
+                        groupName: groupName,
+                        progress: async (value: number) => {
+                            // Implementación de la función progress
+                            this.logger.info(`Progreso del trabajo ${jobId}: ${value}%`);
+                        }
+                    };
+                    
+                    // Ejecutar el consumidor con los datos del trabajo
+                    this.logger.info(`🔄 Procesando trabajo ${jobId} de la cola ${queueName}, grupo ${groupName}`);
+                    await consumer.run(jobData);
+                    
+                    // Solo procesar un trabajo a la vez por consumidor
+                    break;
+                }
+            }
+        } catch (error) {
+            if (error instanceof Error) {
+                this.logger.error(`❌ Error al procesar tareas de la cola ${queueName}: ${error.message}`);
+            } else {
+                this.logger.error(`❌ Error desconocido al procesar tareas de la cola ${queueName}: ${String(error)}`);
+            }
+        } finally {
+            this.redisManager.releaseClient(client);
+        }
     }
 
     public getUid = () => {
@@ -223,11 +298,63 @@ export class Queue {
 
             this.subscriberClient.on('message', async (channel, message) => {
                 this.logger.info(`📨 Mensaje recibido en ${channel}: ${message} desde ${this.uid}.`);
-                const jobData = JSON.parse(message);
+                const jobInfo = JSON.parse(message);
 
-                const consumer = this.consumers.get(jobData.queueName);
+                // Verificar si tenemos un consumidor para esta cola
+                const consumer = this.consumers.get(jobInfo.queueName);
                 if (consumer) {
-                    await consumer.run(jobData);
+                    try {
+                        // Obtener un cliente Redis para dequeue
+                        const client = await this.redisManager.getClient();
+                        try {
+                            // Obtener el SHA del script dequeue
+                            const scriptSha = this.redisManager.getScriptSha('dequeue');
+                            if (!scriptSha) {
+                                this.logger.error('❌ No se pudo obtener el SHA del script "dequeue".');
+                                return;
+                            }
+
+                            // Construir la clave del grupo
+                            const groupKey = `qube:${jobInfo.queueName}:group:${jobInfo.groupName}`;
+                            
+                            // Ejecutar el script dequeue para obtener el trabajo
+                            const result = await client.evalsha(scriptSha, 1, groupKey);
+                            
+                            if (result && Array.isArray(result)) {
+                                // El resultado es un array con [job_id, job_data, group_name]
+                                const [jobId, jobDataStr, groupName] = result;
+                                
+                                // Parsear los datos del trabajo
+                                const jobData = {
+                                    id: jobId,
+                                    data: JSON.parse(jobDataStr),
+                                    groupName: groupName,
+                                    queueName: jobInfo.queueName,
+                                    progress: async (value: number) => {
+                                        // Implementación de la función progress
+                                        this.logger.info(`Progreso del trabajo ${jobId}: ${value}%`);
+                                    }
+                                };
+                                
+                                // Ejecutar el consumidor con los datos del trabajo
+                                this.logger.info(`🔄 Procesando trabajo ${jobId} de la cola ${jobInfo.queueName}`);
+                                await consumer.run(jobData);
+                            } else {
+                                this.logger.info(`⚠️ No hay trabajos pendientes en la cola ${jobInfo.queueName}, grupo ${jobInfo.groupName}`);
+                            }
+                        } finally {
+                            // Liberar el cliente Redis
+                            this.redisManager.releaseClient(client);
+                        }
+                    } catch (error) {
+                        if (error instanceof Error) {
+                            this.logger.error(`❌ Error al procesar trabajo: ${error.message}`);
+                        } else {
+                            this.logger.error(`❌ Error desconocido al procesar trabajo: ${String(error)}`);
+                        }
+                    }
+                } else {
+                    this.logger.warn(`⚠️ No hay consumidor registrado para la cola ${jobInfo.queueName}`);
                 }
             });
         } else {
@@ -272,10 +399,22 @@ export class Queue {
 
         const consumer = new Consumer(uuidv4(), queueName, callback);
         this.consumers.set(queueName, consumer);
+        
+        // Procesar inmediatamente las tareas pendientes para esta cola
+        if (this.type === 'subscriber') {
+            await this.processQueueTasks(queueName, consumer);
+        }
     }
 
     public async close(): Promise<void> {
         this.logger.info('Cerrando conexiones...');
+        
+        // Limpiar el intervalo de procesamiento activo
+        if (this.activeProcessingInterval) {
+            clearInterval(this.activeProcessingInterval);
+            this.activeProcessingInterval = null;
+        }
+        
         await this.redisManager.quit();
     }
 }

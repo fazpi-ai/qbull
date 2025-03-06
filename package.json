@@ -9,6 +9,7 @@
     "build": "tsc",
     "clean": "rm -rf dist",
     "dev": "tsx src/index.ts",
+    "dev2": "tsx src/index2.ts",
     "test": "jest",
     "test:watch": "jest --watchAll"
   },

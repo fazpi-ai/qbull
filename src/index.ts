@@ -2,8 +2,6 @@ import type { RedisOptions } from 'ioredis';
 
 import { Queue } from './Queue';
 
-import { IJobData } from './interfaces/queue.interface';
-
 (async () => {
 
     try {
@@ -31,20 +29,25 @@ import { IJobData } from './interfaces/queue.interface';
         await queue_publisher.init();
         await queue_subscriber.init();
 
+        // Agregamos un trabajo a la cola
+        await queue_publisher.add('WHATSAPP', '573205104418', {
+            message: 'Hola, ¿cómo estás? 1'
+        });
+
+        await queue_publisher.add('WHATSAPP', '573205104418', {
+            message: 'Hola, ¿cómo estás? 2'
+        });
+
+        await queue_publisher.add('WHATSAPP', '573205104418', {
+            message: 'Hola, ¿cómo estás? 3'
+        });
+
         // Nos suscribimos a los eventos de esta instancia
         queue_subscriber.process('WHATSAPP', (job, done) => {
-            console.log("😎 JOBS:")
+            console.log("😎 - JOBS:")
             console.log(job)
             done();
         })
-
-        // Agregamos un trabajo a la cola
-        const jobId = await queue_publisher.add('WHATSAPP', '573205104418', {
-            message: 'Hola, ¿cómo estás?'
-        });
-
-        console.log("😎 JOB ID:")
-        console.log(jobId)
 
         // Cerrar la cola al salir del proceso
         process.on('SIGINT', async () => {
